@@ -114,44 +114,110 @@ elif page == "Datasets":
 # ------------------------------------------------------------ Annotation ---
 elif page == "Annotation":
     st.title("Annotation Tool")
-    st.caption("Draw one box per field, pick its class, and export YOLO "
-               "labels. For large batches use LabelImg/CVAT and import the "
-               "folder via **Datasets**.")
+    st.caption("Upload several report images at once, auto-annotate and "
+               "save them all in one click, then drop into manual review "
+               "only for the ones that need fixing.")
 
-    img_file = st.file_uploader("Report image", type=["png", "jpg", "jpeg"])
-    if img_file:
+    img_files = st.file_uploader("Report image(s)", type=["png", "jpg", "jpeg"],
+                                 accept_multiple_files=True)
+
+    if img_files:
         import cv2
         import numpy as np
 
-        arr = cv2.imdecode(np.frombuffer(img_file.getvalue(), np.uint8),
-                           cv2.IMREAD_COLOR)
+        def _decode(f):
+            f.seek(0)
+            return cv2.imdecode(np.frombuffer(f.getvalue(), np.uint8),
+                                cv2.IMREAD_COLOR)
+
+        st.caption(f"{len(img_files)} image(s) uploaded.")
+
+        default_folder = str(DATASET_DIR / "raw_annotated")
+        dest_folder = st.text_input("Destination folder", value=default_folder,
+                                    key="dest_folder")
+
+        # -------------------------------------------------- Bulk auto mode --
+        st.subheader("Bulk auto-annotate")
+        st.caption("Runs OCR + layout rules on every uploaded image and "
+                  "saves each image + YOLO label straight to the folder "
+                  "above. Images where nothing was detected are skipped "
+                  "so you can review them manually below.")
+
+        if st.button(f"⚡ Auto-annotate & save all {len(img_files)} image(s)",
+                    type="primary"):
+            dest = Path(dest_folder)
+            dest.mkdir(parents=True, exist_ok=True)
+
+            results = []
+            progress = st.progress(0.0)
+            for i, f in enumerate(img_files):
+                arr_i = _decode(f)
+                h_i, w_i = arr_i.shape[:2]
+                boxes_i = auto_annotate(arr_i)
+
+                if not boxes_i:
+                    results.append({"file": f.name, "boxes": 0, "status": "⚠️ skipped — 0 boxes found"})
+                    progress.progress((i + 1) / len(img_files))
+                    continue
+
+                lines = []
+                for cid, bx1, by1, bx2, by2 in boxes_i:
+                    cx, cy = (bx1 + bx2) / 2 / w_i, (by1 + by2) / 2 / h_i
+                    bw, bh = (bx2 - bx1) / w_i, (by2 - by1) / h_i
+                    lines.append(f"{cid} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+
+                cv2.imwrite(str(dest / f.name), arr_i)
+                (dest / Path(f.name).with_suffix(".txt").name).write_text("\n".join(lines))
+                results.append({"file": f.name, "boxes": len(boxes_i), "status": "✅ saved"})
+                progress.progress((i + 1) / len(img_files))
+
+            st.session_state["_bulk_results"] = results
+
+        if st.session_state.get("_bulk_results"):
+            res = st.session_state["_bulk_results"]
+            st.dataframe(pd.DataFrame(res), use_container_width=True, hide_index=True)
+
+            saved = sum(1 for r in res if r["status"].startswith("✅"))
+            skipped = len(res) - saved
+            pairs = [p for p in Path(dest_folder).glob("*")
+                    if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
+                    and p.with_suffix(".txt").exists()] if Path(dest_folder).exists() else []
+            st.success(f"{saved} saved, {skipped} skipped. Folder now has "
+                      f"**{len(pairs)}** total annotated image(s).")
+            if skipped:
+                st.warning("Images with 0 detected boxes need manual "
+                          "annotation — select them below.")
+
+        st.divider()
+
+        # --------------------------------------------- Manual review mode --
+        st.subheader("Manual review / correction")
+        st.caption("Pick one uploaded image to inspect or fix by hand. "
+                  "Useful for images the bulk step skipped or got wrong.")
+
+        selected_name = st.selectbox("Image", [f.name for f in img_files])
+        img_file = next(f for f in img_files if f.name == selected_name)
+        arr = _decode(img_file)
         h, w = arr.shape[:2]
         st.image(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB),
                  caption=f"{img_file.name} — {w}×{h}px",
                  use_container_width=True)
 
-        if "boxes" not in st.session_state:
-            st.session_state.boxes = []
+        if "boxes_by_file" not in st.session_state:
+            st.session_state.boxes_by_file = {}
+        st.session_state.boxes_by_file.setdefault(selected_name, [])
+        current_boxes = st.session_state.boxes_by_file[selected_name]
 
-        st.subheader("Auto-annotate")
-        st.caption("Runs OCR + layout rules to pre-fill candidate boxes. "
-                   "Review and correct them below — this is a starting "
-                   "point, not a final label set.")
         ac1, ac2 = st.columns([1, 3])
         with ac1:
-            if st.button("🪄 Auto-annotate", use_container_width=True):
+            if st.button("🪄 Auto-annotate this image", use_container_width=True):
                 with st.spinner("Reading page layout…"):
                     predicted = auto_annotate(arr)
-                st.session_state.boxes = predicted
-                st.session_state["_auto_count"] = len(predicted)
+                st.session_state.boxes_by_file[selected_name] = predicted
                 st.rerun()
-        if st.session_state.get("_auto_count"):
-            with ac2:
-                st.success(f"{st.session_state['_auto_count']} candidate "
-                          "boxes added — check the table below, fix any "
-                          "that are wrong, then add missed fields manually.")
-
-        st.divider()
+        with ac2:
+            if current_boxes:
+                st.caption(f"{len(current_boxes)} box(es) on this image.")
 
         st.subheader("Add box (pixel coordinates)")
         c1, c2, c3, c4, c5 = st.columns(5)
@@ -162,66 +228,49 @@ elif page == "Annotation":
         cls = c5.selectbox("Class", FIELD_CLASSES)
         if st.button("Add box"):
             if x2 > x1 and y2 > y1:
-                st.session_state.boxes.append((FIELD_CLASSES.index(cls),
-                                               x1, y1, x2, y2))
+                current_boxes.append((FIELD_CLASSES.index(cls), x1, y1, x2, y2))
             else:
                 st.error("x2/y2 must be greater than x1/y1.")
 
-        if st.session_state.boxes:
+        if current_boxes:
             st.dataframe(pd.DataFrame(
                 [{"class": FIELD_CLASSES[b[0]], "x1": b[1], "y1": b[2],
-                  "x2": b[3], "y2": b[4]} for b in st.session_state.boxes]),
+                  "x2": b[3], "y2": b[4]} for b in current_boxes]),
                 use_container_width=True, hide_index=True)
 
             lines = []
-            for cid, bx1, by1, bx2, by2 in st.session_state.boxes:
+            for cid, bx1, by1, bx2, by2 in current_boxes:
                 cx, cy = (bx1 + bx2) / 2 / w, (by1 + by2) / 2 / h
                 bw, bh = (bx2 - bx1) / w, (by2 - by1) / h
                 lines.append(f"{cid} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
             label_name = Path(img_file.name).with_suffix(".txt").name
 
-            st.divider()
-            st.subheader("Save to dataset folder")
-            st.caption("Writes this image + its YOLO label straight to disk, "
-                      "paired by filename — ready for **Datasets → Build** "
-                      "once you've saved a batch this way.")
-
-            default_folder = str(DATASET_DIR / "raw_annotated")
-            save_folder = st.text_input("Destination folder", value=default_folder)
-
             sc1, sc2 = st.columns([1, 3])
             with sc1:
-                save_clicked = st.button("💾 Save to dataset folder",
+                save_clicked = st.button("💾 Save this image to dataset folder",
                                          use_container_width=True, type="primary")
             with sc2:
                 st.download_button("Download YOLO label (.txt) only",
                                    "\n".join(lines), file_name=label_name)
 
             if save_clicked:
-                import cv2
-
-                dest = Path(save_folder)
+                dest = Path(dest_folder)
                 dest.mkdir(parents=True, exist_ok=True)
-
                 img_path = dest / img_file.name
                 label_path = dest / label_name
-
                 if img_path.exists() or label_path.exists():
-                    st.warning(f"{img_file.name} already exists in this "
-                              "folder — saving again will overwrite it.")
-
+                    st.warning(f"{img_file.name} already exists — overwriting.")
                 cv2.imwrite(str(img_path), arr)
                 label_path.write_text("\n".join(lines))
-
                 pairs = [p for p in dest.glob("*")
                         if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
                         and p.with_suffix(".txt").exists()]
                 st.success(f"Saved **{img_file.name}** + **{label_name}** to "
-                          f"`{dest}`. This folder now has "
-                          f"**{len(pairs)}** annotated image(s).")
+                          f"`{dest}`. Folder now has **{len(pairs)}** "
+                          "annotated image(s).")
 
-            if st.button("Clear boxes"):
-                st.session_state.boxes = []
+            if st.button("Clear boxes for this image"):
+                st.session_state.boxes_by_file[selected_name] = []
                 st.rerun()
 
 # -------------------------------------------------------------- Training ---
@@ -251,9 +300,9 @@ elif page == "Training":
                 st.code(" ".join(cmd), language="bash")
                 with st.spinner("Training… live log below"):
                     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT, text=True,
-                        encoding="utf-8", errors="replace",
-                        cwd=str(Path(__file__).parents[2]))
+                                            stderr=subprocess.STDOUT, text=True,
+                                            encoding="utf-8", errors="replace",
+                                            cwd=str(Path(__file__).parents[2]))
                     log_box = st.empty()
                     tail: list[str] = []
                     for line in proc.stdout:
