@@ -1,0 +1,103 @@
+# =========================================================
+# LabVisionAI — .gitignore
+# =========================================================
+
+# ---------------------------------------------------------------- Secrets --
+.env
+*.env.local
+# Keep the example/template so collaborators know what vars are needed
+!.env.example
+
+# ------------------------------------------------------------- Databases ---
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+# DB Browser for SQLite project/session files — can embed query history
+# (including real data used in ad-hoc queries) and local machine paths
+*.sqbpro
+
+# ------------------------------------------------------------ Python -------
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ------------------------------------------------------------ Virtualenv ---
+venv/
+.venv/
+env/
+ENV/
+
+# --------------------------------------------------------- Model weights ---
+# Trained YOLO weights are large binaries — don't belong in git history.
+# Use the Model Registry / external storage (S3, Colab export, etc.)
+# instead, or set up Git LFS if you specifically want to version them.
+models/registry/**/*.pt
+*.pt
+*.onnx
+*.engine
+
+# --------------------------------------------------- Runtime / user data ---
+# Everything under storage/ is generated at runtime or holds real
+# uploaded documents — never commit actual pathology report data.
+storage/uploads/*
+storage/results/*
+storage/exports/*
+storage/logs/*
+storage/datasets/*
+!storage/uploads/.gitkeep
+!storage/results/.gitkeep
+!storage/exports/.gitkeep
+!storage/logs/.gitkeep
+!storage/datasets/.gitkeep
+
+# ------------------------------------------------------------------ Logs ---
+*.log
+logs/
+
+# --------------------------------------------------------------- Node.js ---
+# Only relevant if any tooling here ever pulls in npm packages
+node_modules/
+npm-debug.log*
+
+# ------------------------------------------------------------------- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ------------------------------------------------------------------- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------------------------------------------------------- Jupyter/misc ---
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ------------------------------------------------------- Keep project assets
+!assets/
+!assets/**
+!logo/
+!logo/**
+!icons/
+!icons/**
+!static/
+!static/**
+
+# ------------------------------------------------------- Model artifacts ---
+# Training runs contain real training images baked into visualization
+# files (train_batch*.jpg) plus large binary weights — exclude entirely.
+models/registry/*
+models/runs/*
+!models/registry/.gitkeep
+!models/runs/.gitkeep

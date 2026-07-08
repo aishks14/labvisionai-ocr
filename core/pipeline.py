@@ -1,0 +1,103 @@
+"""
+LabVisionAI — Inference Pipeline (the product's engine room)
+=============================================================
+The single entry point the Customer Portal and API call:
+
+    upload -> load pages -> enhance -> YOLO detect (deployed model)
+    -> crop regions -> Tesseract OCR -> post-process -> persist to DB
+
+No training happens here. Ever. Inference only.
+"""
+
+import time
+from pathlib import Path
+
+import numpy as np
+
+from core.detector import detect_fields
+from core.ocr_engine import read_region
+from core.parser import build_record
+from core.preprocessing import enhance_page, load_pages
+from database.db import log_event, session_scope
+from database.models import Document, Extraction
+
+
+def _crop(image: np.ndarray, box: list[int], pad: int = 4) -> np.ndarray:
+    h, w = image.shape[:2]
+    x1, y1, x2, y2 = box
+    return image[max(0, y1 - pad):min(h, y2 + pad),
+                 max(0, x1 - pad):min(w, x2 + pad)]
+
+
+def process_document(document_id: int) -> dict:
+    """
+    Run the full inference pipeline for a stored Document row.
+    Updates status through processing -> done/failed and returns the record.
+    """
+    started = time.time()
+
+    with session_scope() as s:
+        doc = s.get(Document, document_id)
+        if doc is None:
+            raise ValueError(f"Document {document_id} not found")
+        doc.status = "processing"
+        path, owner = doc.stored_path, doc.owner.email if doc.owner else "?"
+
+    try:
+        pages = load_pages(path)
+        all_detections, confidences, model_version = [], [], ""
+
+        for page_no, page in enumerate(pages, start=1):
+            page = enhance_page(page)
+            detections, model_version = detect_fields(page)
+            for det in detections:
+                text, conf = read_region(_crop(page, det["box"]), det["class"])
+                det.update(text=text, ocr_confidence=conf, page=page_no)
+                if text:
+                    confidences.append(conf)
+            all_detections.extend(detections)
+
+        record = build_record(all_detections)
+        mean_conf = round(float(np.mean(confidences)), 1) if confidences else 0.0
+        elapsed_ms = int((time.time() - started) * 1000)
+
+        with session_scope() as s:
+            doc = s.get(Document, document_id)
+            doc.status, doc.pages, doc.model_version = "done", len(pages), model_version
+            s.add(Extraction(document_id=document_id, header=record["header"],
+                             rows=record["rows"], raw_detections=all_detections,
+                             mean_ocr_confidence=mean_conf, processing_ms=elapsed_ms))
+
+        log_event(owner, "document_processed",
+                  f"doc={document_id} rows={len(record['rows'])} "
+                  f"conf={mean_conf} model={model_version}")
+        return {**record, "mean_ocr_confidence": mean_conf,
+                "processing_ms": elapsed_ms, "model_version": model_version}
+
+    except Exception as exc:
+        with session_scope() as s:
+            doc = s.get(Document, document_id)
+            doc.status, doc.error = "failed", str(exc)[:1000]
+        log_event(owner, "document_failed", f"doc={document_id}: {exc}")
+        raise
+
+
+def save_upload(owner_id: int, filename: str, data: bytes) -> int:
+    """Persist an uploaded file to storage and create its Document row."""
+    from config.settings import ALLOWED_EXTENSIONS, MAX_UPLOAD_MB, UPLOAD_DIR
+
+    suffix = Path(filename).suffix.lower()
+    if suffix not in ALLOWED_EXTENSIONS:
+        raise ValueError(f"Unsupported file type: {suffix}")
+    if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
+        raise ValueError(f"File exceeds {MAX_UPLOAD_MB} MB limit")
+
+    with session_scope() as s:
+        doc = Document(owner_id=owner_id, filename=filename,
+                       file_type=suffix.lstrip("."), stored_path="")
+        s.add(doc)
+        s.flush()
+        stored = UPLOAD_DIR / f"{doc.id}{suffix}"
+        stored.write_bytes(data)
+        doc.stored_path = str(stored)
+        return doc.id

@@ -1,0 +1,30 @@
+# LabVisionAI — production-style topology:
+#   api      : REST backend (public)          -> :8000
+#   customer : Customer Portal (public)       -> :8501
+#   admin    : Admin Portal (internal only!)  -> :8502  (bind to VPN in prod)
+services:
+  api:
+    build: .
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8000
+    ports: ["8000:8000"]
+    volumes: [shared-data:/app/storage, shared-models:/app/models, shared-db:/app]
+    env_file: [.env]
+
+  customer:
+    build: .
+    command: streamlit run portals/customer/app.py --server.port 8501 --server.address 0.0.0.0
+    ports: ["8501:8501"]
+    volumes: [shared-data:/app/storage, shared-models:/app/models, shared-db:/app]
+    env_file: [.env]
+
+  admin:
+    build: .
+    command: streamlit run portals/admin/app.py --server.port 8502 --server.address 0.0.0.0
+    ports: ["127.0.0.1:8502:8502"]   # localhost only — never expose publicly
+    volumes: [shared-data:/app/storage, shared-models:/app/models, shared-db:/app]
+    env_file: [.env]
+
+volumes:
+  shared-data:
+  shared-models:
+  shared-db:
