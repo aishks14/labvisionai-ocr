@@ -63,27 +63,37 @@ def _center_y(det):
 def assemble_rows(detections: list[dict]) -> list[dict]:
     """
     Group row-field detections into table rows by vertical alignment:
-    each test_name anchors a row; value/unit/range whose y-center falls
-    within the anchor's vertical band join that row.
+    each test_name anchors a row; value/unit/range join whichever
+    anchor's center they sit closest to (within a max band), not just
+    any anchor within range — this prevents a single detection from
+    being claimed by two adjacent rows when boxes sit close together.
     """
     anchors = sorted([d for d in detections if d["class"] == "test_name"],
                      key=_center_y)
     others = [d for d in detections if d["class"] in ROW_FIELDS - {"test_name"}]
 
-    rows = []
-    for anchor in anchors:
-        y1, y2 = anchor["box"][1], anchor["box"][3]
-        band = max(14, (y2 - y1) * 0.8)
-        row = {"test_name": anchor["text"], "value": "", "unit": "",
-               "reference_range": ""}
-        for det in others:
-            if abs(_center_y(det) - (y1 + y2) / 2) <= band and not row[det["class"]]:
-                row[det["class"]] = det["text"]
+    rows = [{"test_name": a["text"], "value": "", "unit": "",
+            "reference_range": ""} for a in anchors]
+
+    for det in others:
+        det_y = _center_y(det)
+        best_i, best_dist = None, None
+        for i, anchor in enumerate(anchors):
+            y1, y2 = anchor["box"][1], anchor["box"][3]
+            band = max(14, (y2 - y1) * 0.8)
+            dist = abs(det_y - (y1 + y2) / 2)
+            if dist <= band and (best_dist is None or dist < best_dist):
+                best_i, best_dist = i, dist
+        if best_i is not None and not rows[best_i][det["class"]]:
+            rows[best_i][det["class"]] = det["text"]
+
+    final = []
+    for row in rows:
         row["value"] = normalize_value(row["value"])
         row["flag"] = compute_flag(row["value"], row["reference_range"])
         if row["test_name"]:
-            rows.append(row)
-    return rows
+            final.append(row)
+    return final
 
 
 def build_record(detections: list[dict]) -> dict:
