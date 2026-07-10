@@ -1,153 +1,90 @@
 """
 LabVisionAI — Auto-annotation assistant
 =========================================
-Runs Tesseract on a full report page, groups words into lines/columns
-by position, and applies keyword + layout rules to pre-fill candidate
-bounding boxes for the known FIELD_CLASSES.
+Runs Tesseract on a full report page and finds the bounding envelope
+of the header info block and the results table, so the Annotation
+page can pre-fill 2 candidate region boxes instead of one per field.
 
-This is a bootstrapping aid, not a replacement for the trained YOLO
-detector — it exists to turn "draw every box by hand" into "review
-and fix the boxes that are wrong." Typical accuracy on a clean scan
-is high for test_name/value/unit; header fields (name/age/gender)
-and reference_range are the most likely to need a manual nudge.
+v2 note: this used to emit ~50 tiny per-field boxes for a 9-class
+scheme. Detecting individual field boxes reliably needs a lot more
+training data than a small dataset provides — see core/table_parser.py
+for the full reasoning. Annotating 2 coarse regions per image is both
+far faster to review by hand AND a much easier detection task for a
+small model to actually learn well.
 """
 
 from __future__ import annotations
 
-import re
-
 import numpy as np
-import pytesseract
-from pytesseract import Output
 
-from config.settings import FIELD_CLASSES, OCR_LANG, TESSERACT_CMD
+from config.settings import FIELD_CLASSES
+from core.table_parser import cluster_columns, get_lines
 
-if TESSERACT_CMD:
-    pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
-
-GAP_THRESHOLD = 35  # px gap that separates two columns/fields on the same line
-HEADER_ZONE_RATIO = 0.45  # top portion of the page treated as patient/header info
+END_OF_TABLE_MARKERS = ("comment", "please correlate", "method", "end of report",
+                        "interpretation", "note:")
 
 
-def _get_lines(gray_or_bgr: np.ndarray) -> list[dict]:
-    """OCR the page and group words into lines with word-level boxes."""
-    data = pytesseract.image_to_data(gray_or_bgr, lang=OCR_LANG,
-                                     config="--psm 6", output_type=Output.DICT)
-
-    lines: dict[tuple, dict] = {}
-    n = len(data["text"])
-
-    for i in range(n):
-        text = data["text"][i].strip()
-        if not text:
-            continue
-        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-        x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
-        lines.setdefault(key, {"words": []})["words"].append(
-            {"text": text, "x1": x, "y1": y, "x2": x + w, "y2": y + h})
-
-    result = []
-    for L in lines.values():
-        L["words"].sort(key=lambda w: w["x1"])
-        L["y1"] = min(w["y1"] for w in L["words"])
-        L["y2"] = max(w["y2"] for w in L["words"])
-        result.append(L)
-
-    result.sort(key=lambda L: L["y1"])
-    return result
+def _line_text(L: dict) -> str:
+    return " ".join(w["text"] for w in L["words"])
 
 
-def _cluster_columns(words: list[dict]) -> list[dict]:
-    """Split a line's words into column clusters based on x-gaps."""
-    clusters, current = [], [words[0]]
-    for prev, cur in zip(words, words[1:]):
-        if cur["x1"] - prev["x2"] > GAP_THRESHOLD:
-            clusters.append(current)
-            current = [cur]
-        else:
-            current.append(cur)
-    clusters.append(current)
-
-    return [{
-        "text": " ".join(w["text"] for w in c),
-        "x1": min(w["x1"] for w in c), "y1": min(w["y1"] for w in c),
-        "x2": max(w["x2"] for w in c), "y2": max(w["y2"] for w in c),
-    } for c in clusters]
-
-
-def _parse_patient_block(clusters: list[dict], boxes: list[dict]) -> None:
-    for i, c in enumerate(clusters):
-        t = c["text"].upper()
-
-        if t.startswith("NAME") and "TEST" not in t and i + 1 < len(clusters):
-            value = clusters[i + 1]
-            m = re.match(r"^(.*?)\s*\(?(\d{1,3})\s*Y\s*/\s*(\w)\)?", value["text"], re.I)
-            if m:
-                name_part = m.group(1).strip(" :")
-                if name_part:
-                    boxes.append({"class": "patient_name", "x1": value["x1"], "y1": value["y1"],
-                                 "x2": value["x1"] + int((value["x2"] - value["x1"]) * 0.6),
-                                 "y2": value["y2"]})
-                boxes.append({"class": "age", **{k: value[k] for k in ("x1", "y1", "x2", "y2")}})
-                boxes.append({"class": "gender", **{k: value[k] for k in ("x1", "y1", "x2", "y2")}})
-            elif value["text"].strip(" :"):
-                boxes.append({"class": "patient_name", **{k: value[k] for k in ("x1", "y1", "x2", "y2")}})
-
-        elif t.startswith("REF") and i + 1 < len(clusters):
-            value = clusters[i + 1]
-            if value["text"].strip(" :"):
-                boxes.append({"class": "doctor_name", **{k: value[k] for k in ("x1", "y1", "x2", "y2")}})
-
-        elif t.startswith("DATE") and i + 1 < len(clusters):
-            value = clusters[i + 1]
-            if value["text"].strip(" :"):
-                boxes.append({"class": "report_date", **{k: value[k] for k in ("x1", "y1", "x2", "y2")}})
-
-
-def _parse_table(lines: list[dict], boxes: list[dict]) -> None:
-    header_idx = None
-    for i, L in enumerate(lines):
-        line_text = " ".join(w["text"] for w in L["words"]).upper()
-        if "TEST" in line_text and ("VALUE" in line_text or "TECHNOLOGY" in line_text):
-            header_idx = i
-            break
-    if header_idx is None:
-        return
-
-    # column order left-to-right; only classes present in FIELD_CLASSES are kept
-    column_labels = ["test_name", "technology", "value", "unit", "reference_range"]
-
-    for L in lines[header_idx + 1:]:
-        clusters = _cluster_columns(L["words"])
-        if len(clusters) < 3:
-            continue
-        for label, c in zip(column_labels, clusters):
-            if label in FIELD_CLASSES:
-                boxes.append({"class": label, "x1": c["x1"], "y1": c["y1"],
-                             "x2": c["x2"], "y2": c["y2"]})
+def _bbox(lines: list[dict]) -> tuple[int, int, int, int] | None:
+    if not lines:
+        return None
+    x1 = min(w["x1"] for L in lines for w in L["words"])
+    y1 = min(L["y1"] for L in lines)
+    x2 = max(w["x2"] for L in lines for w in L["words"])
+    y2 = max(L["y2"] for L in lines)
+    return x1, y1, x2, y2
 
 
 def auto_annotate(image_bgr: np.ndarray) -> list[tuple[int, int, int, int, int]]:
     """
     Run OCR + layout rules on a full report page image (BGR, as decoded
-    by cv2) and return candidate boxes in the same format used by the
-    Annotation page's session state: (class_id, x1, y1, x2, y2).
+    by cv2) and return candidate region boxes in the same format used
+    by the Annotation page's session state: (class_id, x1, y1, x2, y2).
 
-    Unrecognised regions are simply omitted — this is meant to reduce
-    manual box-drawing, not to be a complete or final label set.
+    Finds two regions: everything from the patient "NAME" line down to
+    (not including) the results-table header row = header_block; the
+    table header row through the last recognizable data row =
+    results_table. Falls back gracefully if either marker isn't found.
     """
-    h = image_bgr.shape[0]
-    lines = _get_lines(image_bgr)
+    lines = get_lines(image_bgr)
+    if not lines:
+        return []
+
+    name_idx = next((i for i, L in enumerate(lines)
+                     if "NAME" in _line_text(L).upper()
+                     and "TEST NAME" not in _line_text(L).upper()), None)
+
+    table_start_idx = next((i for i, L in enumerate(lines)
+                            if "TEST" in _line_text(L).upper()
+                            and ("VALUE" in _line_text(L).upper()
+                                 or "TECHNOLOGY" in _line_text(L).upper())), None)
+
+    table_end_idx = None
+    if table_start_idx is not None:
+        for i in range(table_start_idx + 1, len(lines)):
+            text_lower = _line_text(lines[i]).lower()
+            if any(marker in text_lower for marker in END_OF_TABLE_MARKERS):
+                table_end_idx = i
+                break
 
     boxes: list[dict] = []
 
-    header_lines = [L for L in lines if L["y1"] < h * HEADER_ZONE_RATIO]
-    for L in header_lines:
-        _parse_patient_block(_cluster_columns(L["words"]), boxes)
+    header_start = name_idx if name_idx is not None else 0
+    header_end = table_start_idx if table_start_idx is not None else min(len(lines), header_start + 5)
+    header_bbox = _bbox(lines[header_start:header_end])
+    if header_bbox:
+        boxes.append({"class": "header_block", "box": header_bbox})
 
-    _parse_table(lines, boxes)
+    if table_start_idx is not None:
+        table_lines = lines[table_start_idx:table_end_idx]
+        table_bbox = _bbox(table_lines)
+        if table_bbox:
+            boxes.append({"class": "results_table", "box": table_bbox})
 
     return [
-        (FIELD_CLASSES.index(b["class"]), b["x1"], b["y1"], b["x2"], b["y2"])
+        (FIELD_CLASSES.index(b["class"]), *b["box"])
         for b in boxes if b["class"] in FIELD_CLASSES
     ]

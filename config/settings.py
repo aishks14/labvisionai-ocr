@@ -43,16 +43,18 @@ YOLO_IOU = float(os.getenv("LVA_YOLO_IOU", "0.45"))
 YOLO_IMG_SIZE = int(os.getenv("LVA_YOLO_IMGSZ", "1024"))
 
 # Field classes the detector is trained on (index = YOLO class id).
+#
+# v2 scheme: coarse regions only. A 9-class per-field scheme (patient_
+# name/age/gender/.../reference_range as separate classes) needs a large,
+# diverse training set to get reliable per-field recall and tight box
+# regression — with a small dataset it tends to miss whole rows or mis-box
+# adjacent fields. Detecting just these 2 regions is a much easier task
+# for a small model; everything inside each region is then parsed
+# deterministically by core/table_parser.py using OCR word positions,
+# not further ML classification. See core/table_parser.py's docstring.
 FIELD_CLASSES = [
-    "patient_name",
-    "age",
-    "gender",
-    "doctor_name",
-    "report_date",
-    "test_name",
-    "value",
-    "unit",
-    "reference_range",
+    "header_block",
+    "results_table",
 ]
 
 # --------------------------------------------------------------- OCR -------

@@ -3,10 +3,19 @@ LabVisionAI — Inference Pipeline (the product's engine room)
 =============================================================
 The single entry point the Customer Portal and API call:
 
-    upload -> load pages -> enhance -> YOLO detect (deployed model)
-    -> crop regions -> Tesseract OCR -> post-process -> persist to DB
+    upload -> load pages -> enhance -> YOLO detect 2 coarse regions
+    (deployed model) -> crop header_block + results_table -> parse
+    each region deterministically (core/table_parser.py) -> persist
 
 No training happens here. Ever. Inference only.
+
+v2 note: this used to crop and OCR one small region per individual
+field (9 classes) and hand every detection to core/parser.py's
+build_record for ML-driven field assembly. It now detects only 2
+coarse regions and parses their contents deterministically — see
+core/table_parser.py for why. core/parser.py's utility functions
+(clean_text, normalize_value, compute_flag) are still used internally
+by table_parser.py.
 """
 
 import time
@@ -15,18 +24,25 @@ from pathlib import Path
 import numpy as np
 
 from core.detector import detect_fields
-from core.ocr_engine import read_region
-from core.parser import build_record
 from core.preprocessing import enhance_page, load_pages
+from core.table_parser import parse_header_region, parse_table_region
 from database.db import log_event, session_scope
 from database.models import Document, Extraction
 
 
-def _crop(image: np.ndarray, box: list[int], pad: int = 4) -> np.ndarray:
+def _crop(image: np.ndarray, box: list[int], pad: int = 6) -> np.ndarray:
     h, w = image.shape[:2]
     x1, y1, x2, y2 = box
     return image[max(0, y1 - pad):min(h, y2 + pad),
                  max(0, x1 - pad):min(w, x2 + pad)]
+
+
+def _best_box(detections: list[dict], field_class: str) -> list[int] | None:
+    """Highest-confidence detection for a given coarse class, if any."""
+    candidates = [d for d in detections if d["class"] == field_class]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda d: d["confidence"])["box"]
 
 
 def process_document(document_id: int) -> dict:
@@ -45,27 +61,49 @@ def process_document(document_id: int) -> dict:
 
     try:
         pages = load_pages(path)
-        all_detections, confidences, model_version = [], [], ""
+        header: dict = {}
+        rows: list[dict] = []
+        ocr_confidences: list[float] = []
+        model_version = ""
 
-        for page_no, page in enumerate(pages, start=1):
+        for page in pages:
             page = enhance_page(page)
             detections, model_version = detect_fields(page)
-            for det in detections:
-                text, conf = read_region(_crop(page, det["box"]), det["class"])
-                det.update(text=text, ocr_confidence=conf, page=page_no)
-                if text:
-                    confidences.append(conf)
-            all_detections.extend(detections)
+            h, w = page.shape[:2]
 
-        record = build_record(all_detections)
-        mean_conf = round(float(np.mean(confidences)), 1) if confidences else 0.0
+            header_box = _best_box(detections, "header_block")
+            if header_box and not header:
+                header, conf = parse_header_region(_crop(page, header_box))
+                if header:
+                    ocr_confidences.append(conf)
+
+            table_box = _best_box(detections, "results_table")
+            if table_box:
+                table_rows, conf = parse_table_region(_crop(page, table_box))
+
+                if not table_rows:
+                    # The detected box may be too tight or slightly
+                    # mispositioned — retry against a generously
+                    # widened crop before giving up on this page.
+                    x1, y1, x2, y2 = table_box
+                    pad_x, pad_y = int(0.05 * w), int(0.08 * h)
+                    wide_box = [max(0, x1 - pad_x), max(0, y1 - pad_y),
+                               min(w, x2 + pad_x), min(h, y2 + pad_y)]
+                    table_rows, conf = parse_table_region(_crop(page, wide_box))
+
+                if table_rows:
+                    ocr_confidences.append(conf)
+                rows.extend(table_rows)
+
+        mean_conf = round(float(np.mean(ocr_confidences)), 1) if ocr_confidences else 0.0
         elapsed_ms = int((time.time() - started) * 1000)
+        record = {"header": header, "rows": rows}
 
         with session_scope() as s:
             doc = s.get(Document, document_id)
             doc.status, doc.pages, doc.model_version = "done", len(pages), model_version
             s.add(Extraction(document_id=document_id, header=record["header"],
-                             rows=record["rows"], raw_detections=all_detections,
+                             rows=record["rows"], raw_detections=[],
                              mean_ocr_confidence=mean_conf, processing_ms=elapsed_ms))
 
         log_event(owner, "document_processed",

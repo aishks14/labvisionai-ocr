@@ -2,7 +2,7 @@
 LabVisionAI — Field Detector (YOLO inference)
 ==============================================
 Loads the ACTIVE model from the registry exactly once (singleton) and
-returns labelled bounding boxes for the 9 lab-report field classes.
+returns labelled bounding boxes for the current FIELD_CLASSES scheme.
 Customers never touch this — the pipeline calls it internally.
 """
 
@@ -19,6 +19,18 @@ class NoDeployedModelError(RuntimeError):
     """Raised when no model has been promoted to 'active' in the registry."""
 
 
+class IncompatibleModelError(RuntimeError):
+    """
+    Raised when the deployed model's own class names don't overlap
+    with the current FIELD_CLASSES scheme — e.g. a model trained
+    before FIELD_CLASSES changed (a 9-per-field scheme vs the current
+    coarse header_block/results_table scheme). This fails loudly and
+    immediately rather than silently returning detections that never
+    match anything downstream, which otherwise looks like "0 results,
+    no error" and is very hard to diagnose from the UI alone.
+    """
+
+
 def _load_model():
     active = get_active_model()
     if active is None:
@@ -29,7 +41,21 @@ def _load_model():
     version, weights = active
     if _model_cache.get("version") != version:
         from ultralytics import YOLO
-        _model_cache["model"] = YOLO(str(weights))
+        model = YOLO(str(weights))
+
+        model_classes = set((model.names or {}).values())
+        expected = set(FIELD_CLASSES)
+        if model_classes and not (model_classes & expected):
+            raise IncompatibleModelError(
+                f"Deployed model '{version}' was trained on class scheme "
+                f"{sorted(model_classes)}, but this app now expects "
+                f"{sorted(expected)}. This happens after FIELD_CLASSES "
+                f"changes in config/settings.py — retrain and promote a "
+                f"new model using the current Annotation classes before "
+                f"customers can process reports."
+            )
+
+        _model_cache["model"] = model
         _model_cache["version"] = version
     return _model_cache["model"], version
 

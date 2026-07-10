@@ -20,27 +20,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import pandas as pd
 import streamlit as st
 
-from config.settings import (APP_NAME, APP_VERSION, DATASET_DIR,
-                             FIELD_CLASSES)
+from config.settings import APP_NAME, DATASET_DIR, FIELD_CLASSES
 from core.auto_annotate import auto_annotate
 from core.registry import (get_active_model, list_models, promote_model,
                            retire_model)
 from database.db import SessionLocal, init_db
 from database.models import (AuditLog, Dataset, Document, ModelVersion, User)
-from portals.common import logout_button, require_login
+from portals.common import render_sidebar, require_login, styled_df
 
 st.set_page_config(page_title=f"{APP_NAME} — Admin", page_icon="🛠️",
                    layout="wide")
 init_db()
 
 user = require_login(required_role="admin")
-logout_button()
 
-st.sidebar.title(f"🛠️ {APP_NAME} Admin")
-page = st.sidebar.radio("Navigation",
-                        ["Dashboard", "Datasets", "Annotation", "Training",
-                         "Model Registry", "Deployments", "Users",
-                         "System Logs"])
+NAV_ITEMS = [("dashboard", "Dashboard"), ("database", "Datasets"),
+            ("label", "Annotation"), ("model_training", "Training"),
+            ("inventory_2", "Model Registry"), ("rocket_launch", "Deployments"),
+            ("group", "Users"), ("receipt_long", "System Logs")]
+page = render_sidebar(f"{APP_NAME} Admin", "Internal AI Platform", NAV_ITEMS, user)
 
 
 def _db():
@@ -54,7 +52,7 @@ if page == "Dashboard":
     try:
         active = get_active_model()
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Deployed model", active[0] if active else "NONE ⚠️")
+        c1.metric("Deployed model", active[0] if active else "None")
         c2.metric("Registered models", db.query(ModelVersion).count())
         c3.metric("Customers",
                   db.query(User).filter_by(role="customer").count())
@@ -69,12 +67,13 @@ if page == "Dashboard":
         docs = (db.query(Document).order_by(Document.created_at.desc())
                 .limit(15).all())
         if docs:
-            st.dataframe(pd.DataFrame(
+            docs_df = pd.DataFrame(
                 [{"ID": d.id, "File": d.filename, "Owner": d.owner.email
                   if d.owner else "?", "Status": d.status,
                   "Model": d.model_version,
                   "When": d.created_at.strftime("%d %b %H:%M")}
-                 for d in docs]), use_container_width=True, hide_index=True)
+                 for d in docs])
+            st.dataframe(styled_df(docs_df), width='stretch', hide_index=True)
     finally:
         db.close()
 
@@ -88,11 +87,12 @@ elif page == "Datasets":
     try:
         rows = db.query(Dataset).order_by(Dataset.created_at.desc()).all()
         if rows:
-            st.dataframe(pd.DataFrame(
+            ds_df = pd.DataFrame(
                 [{"Name": d.name, "Images": d.n_images,
                   "Annotated": d.n_annotated, "Path": d.root_path,
                   "Created": d.created_at.strftime("%d %b %Y")}
-                 for d in rows]), use_container_width=True, hide_index=True)
+                 for d in rows])
+            st.dataframe(styled_df(ds_df), width='stretch', hide_index=True)
         else:
             st.info("No datasets registered yet.")
     finally:
@@ -143,7 +143,8 @@ elif page == "Annotation":
                   "above. Images where nothing was detected are skipped "
                   "so you can review them manually below.")
 
-        if st.button(f"⚡ Auto-annotate & save all {len(img_files)} image(s)",
+        if st.button(f"Auto-annotate & save all {len(img_files)} image(s)",
+                    icon=":material/bolt:",
                     type="primary"):
             dest = Path(dest_folder)
             dest.mkdir(parents=True, exist_ok=True)
@@ -175,7 +176,7 @@ elif page == "Annotation":
 
         if st.session_state.get("_bulk_results"):
             res = st.session_state["_bulk_results"]
-            st.dataframe(pd.DataFrame(res), use_container_width=True, hide_index=True)
+            st.dataframe(styled_df(pd.DataFrame(res)), width='stretch', hide_index=True)
 
             saved = sum(1 for r in res if r["status"].startswith("✅"))
             skipped = len(res) - saved
@@ -201,7 +202,7 @@ elif page == "Annotation":
         h, w = arr.shape[:2]
         st.image(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB),
                  caption=f"{img_file.name} — {w}×{h}px",
-                 use_container_width=True)
+                 width='stretch')
 
         if "boxes_by_file" not in st.session_state:
             st.session_state.boxes_by_file = {}
@@ -210,7 +211,8 @@ elif page == "Annotation":
 
         ac1, ac2 = st.columns([1, 3])
         with ac1:
-            if st.button("🪄 Auto-annotate this image", use_container_width=True):
+            if st.button("Auto-annotate this image", icon=":material/auto_fix_high:",
+                        width='stretch'):
                 with st.spinner("Reading page layout…"):
                     predicted = auto_annotate(arr)
                 st.session_state.boxes_by_file[selected_name] = predicted
@@ -233,10 +235,10 @@ elif page == "Annotation":
                 st.error("x2/y2 must be greater than x1/y1.")
 
         if current_boxes:
-            st.dataframe(pd.DataFrame(
+            boxes_df = pd.DataFrame(
                 [{"class": FIELD_CLASSES[b[0]], "x1": b[1], "y1": b[2],
-                  "x2": b[3], "y2": b[4]} for b in current_boxes]),
-                use_container_width=True, hide_index=True)
+                  "x2": b[3], "y2": b[4]} for b in current_boxes])
+            st.dataframe(styled_df(boxes_df), width='stretch', hide_index=True)
 
             lines = []
             for cid, bx1, by1, bx2, by2 in current_boxes:
@@ -247,8 +249,9 @@ elif page == "Annotation":
 
             sc1, sc2 = st.columns([1, 3])
             with sc1:
-                save_clicked = st.button("💾 Save this image to dataset folder",
-                                         use_container_width=True, type="primary")
+                save_clicked = st.button("Save this image to dataset folder",
+                                         icon=":material/save:",
+                                         width='stretch', type="primary")
             with sc2:
                 st.download_button("Download YOLO label (.txt) only",
                                    "\n".join(lines), file_name=label_name)
@@ -327,7 +330,7 @@ elif page == "Model Registry":
             st.info("No models registered. Train one, or register external "
                     "weights below.")
         else:
-            st.dataframe(pd.DataFrame(
+            reg_df = pd.DataFrame(
                 [{"Version": m.version, "Status": m.status,
                   "mAP50": (m.metrics or {}).get("mAP50", "—"),
                   "Precision": (m.metrics or {}).get("precision", "—"),
@@ -335,7 +338,9 @@ elif page == "Model Registry":
                   "Dataset": m.dataset_name,
                   "By": m.created_by,
                   "Created": m.created_at.strftime("%d %b %Y")}
-                 for m in rows]), use_container_width=True, hide_index=True)
+                 for m in rows])
+            st.dataframe(styled_df(reg_df, flag_col="Status"),
+                        width='stretch', hide_index=True)
 
             versions = [m.version for m in rows]
             c1, c2 = st.columns(2)
@@ -396,10 +401,11 @@ elif page == "Deployments":
                                                "model_retired"]))
                   .order_by(AuditLog.created_at.desc()).limit(50).all())
         if events:
-            st.dataframe(pd.DataFrame(
+            events_df = pd.DataFrame(
                 [{"When": e.created_at.strftime("%d %b %Y %H:%M"),
                   "Actor": e.actor, "Action": e.action, "Detail": e.detail}
-                 for e in events]), use_container_width=True, hide_index=True)
+                 for e in events])
+            st.dataframe(styled_df(events_df), width='stretch', hide_index=True)
     finally:
         db.close()
 
@@ -409,11 +415,13 @@ elif page == "Users":
     db = _db()
     try:
         rows = db.query(User).all()
-        st.dataframe(pd.DataFrame(
+        users_df = pd.DataFrame(
             [{"ID": u.id, "Email": u.email, "Role": u.role,
-              "Organization": u.organization, "Active": u.is_active,
-              "Joined": u.created_at.strftime("%d %b %Y")} for u in rows]),
-            use_container_width=True, hide_index=True)
+              "Organization": u.organization,
+              "Active": "active" if u.is_active else "disabled",
+              "Joined": u.created_at.strftime("%d %b %Y")} for u in rows])
+        st.dataframe(styled_df(users_df, flag_col="Active"),
+                    width='stretch', hide_index=True)
 
         st.subheader("Toggle account status")
         target = st.selectbox("User", [u.email for u in rows
@@ -438,11 +446,10 @@ elif page == "System Logs":
         if action_filter.strip():
             q = q.filter(AuditLog.action.contains(action_filter.strip()))
         rows = q.limit(300).all()
-        st.dataframe(pd.DataFrame(
+        logs_df = pd.DataFrame(
             [{"When": r.created_at.strftime("%d %b %Y %H:%M:%S"),
               "Actor": r.actor, "Action": r.action, "Detail": r.detail}
-             for r in rows]), use_container_width=True, hide_index=True)
+             for r in rows])
+        st.dataframe(styled_df(logs_df), width='stretch', hide_index=True)
     finally:
         db.close()
-
-st.sidebar.caption(f"{APP_NAME} v{APP_VERSION} — internal platform")
